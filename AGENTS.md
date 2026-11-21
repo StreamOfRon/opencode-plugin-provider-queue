@@ -69,10 +69,17 @@ npm run typecheck   # tsc --noEmit over src/
 npm test            # node --experimental-strip-types --test test/*.test.mts
 ```
 
-Every test must release every ticket it acquires: a leaked ticket leaves an
-armed 15-minute lease timer that stalls the test process after the last
-assertion. Tests that read config use an `XDG_CONFIG_HOME` fixture — never
-the real `~/.config/opencode`.
+Every test file must keep `import "./bootstrap.mts"` as its first import of
+project code: the bootstrap redirects `HOME` to a temp fixture so the
+plugin's `log()` (which resolves `LOG_PATH` from `homedir()` at module load)
+can never append to the real `~/.local/share/opencode/log/provider-queue.log`
+— that file is the human operational signal, including the per-location
+`loaded for` single-load line. Tests that read config use an
+`XDG_CONFIG_HOME` fixture — never the real `~/.config/opencode`.
+
+Every test must also release every ticket it acquires: a leaked ticket leaves
+an armed 15-minute lease timer that stalls the test process after the last
+assertion.
 
 ## Release flow
 

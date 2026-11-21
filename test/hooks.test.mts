@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
+import "./bootstrap.mts";
 import { buildHandlers, queues, openTicket, release } from "../src/index.ts";
 
 // Config fixture: every queued provider at concurrency 1; `otherp` absent.

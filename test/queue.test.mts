@@ -4,6 +4,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import "./bootstrap.mts";
 import { queueFor, acquire, release, openTicket, queues } from "../src/index.ts";
 
 const flush = () => new Promise((r) => setImmediate(r));
