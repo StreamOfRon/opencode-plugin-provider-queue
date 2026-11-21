@@ -3,7 +3,7 @@
  * Run with: npm test
  */
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -159,14 +159,30 @@ test("unparseable config files are skipped", () => {
       '{ "providers": { "goodp": { "settings": { "concurrency": 1 } } } }',
     );
     const project = mkdtempSync(join(tmpdir(), "pq-proj-"));
+    const logPath = join(process.env.HOME!, ".local", "share", "opencode", "log", "provider-queue.log");
+    const readLog = () => {
+      try {
+        return readFileSync(logPath, "utf8");
+      } catch {
+        return ""; // the file is created on the plugin's first log write
+      }
+    };
+    const before = readLog();
     try {
       const limits = limitsFor(project); // must not throw
       assert.equal(limits.providers.get("goodp"), 1);
+      const appended = readLog().slice(before.length);
+      assert.match(appended, new RegExp(`skipping ${escapeRe(join(cfgDir, "opencode.json"))}`));
+      assert.doesNotMatch(appended, /opencode\.jsonc/); // the valid sibling is not logged as skipped
     } finally {
       rmSync(project, { recursive: true, force: true });
     }
   });
 });
+
+function escapeRe(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
 
 // ---- selectQueue ---------------------------------------------------------------
 

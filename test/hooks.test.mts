@@ -126,6 +126,41 @@ test("retry reclaims a never-responded ticket but not a running stream", async (
   assert.equal(q.active, 0);
 });
 
+test("model-less response falls back to the session's last queued selection", async () => {
+  await handlers.httpRequest(req("testp", "fb1"));
+  const q = queueOf("testp");
+  assert.equal(q.active, 1);
+
+  // Some hook events omit `model` entirely; the session's queued selection
+  // must carry the pairing so the stream still owns and releases the slot.
+  const ev: { kind: string; sessionID: string; response: Response } = {
+    kind: "primary",
+    sessionID: "fb1",
+    response: new Response(closingStream()),
+  };
+  handlers.httpResponse(ev as never);
+  assert.equal(q.active, 1); // wrapped, held until drained
+  await ev.response.text();
+  assert.equal(q.active, 0);
+});
+
+test("a queued-model event that resolves unqueued does not inherit the session selection", async () => {
+  await handlers.httpRequest(req("testp", "fb2"));
+  const q = queueOf("testp");
+  assert.equal(q.active, 1);
+
+  // Same session, but a model that has no queue: the direct lookup misses
+  // and an event WITH a model must not fall back to fb2's session selection.
+  const orig = new Response(closingStream());
+  const ev = { kind: "primary", model: { providerID: "nqx", id: "y" }, sessionID: "fb2", response: orig };
+  handlers.httpResponse(ev);
+  assert.equal(ev.response, orig); // not wrapped
+  assert.equal(q.active, 1); // slot untouched
+
+  const t = openTicket(q); // cleanup: release fb2's still-held ticket
+  if (t) release(q, t);
+});
+
 test("unqueued providers pass through", async () => {
   let done = false;
   await handlers.httpRequest(req("otherp", "s1")).then(() => (done = true));

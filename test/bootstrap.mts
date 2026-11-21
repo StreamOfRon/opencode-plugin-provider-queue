@@ -11,10 +11,15 @@
  * config fallback reads the fixture instead of the developer's config.
  * Tests that need a global config still set XDG_CONFIG_HOME themselves.
  */
-import { mkdtempSync } from "node:fs";
+import { mkdirSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const home = mkdtempSync(join(tmpdir(), "pq-test-home-"));
 process.env.HOME = home;
 process.env.USERPROFILE = home;
+
+// Create the log directory under the fixture HOME so plugin log() lines land
+// IN the fixture (observable by tests) instead of failing into the catch —
+// the real homedir-based operational log stays untouched either way.
+mkdirSync(join(home, ".local", "share", "opencode", "log"), { recursive: true });
