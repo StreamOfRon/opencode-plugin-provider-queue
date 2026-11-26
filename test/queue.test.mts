@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import "./bootstrap.mts";
-import { queueFor, acquire, release, openTicket, queues } from "../src/index.ts";
+import { queueFor, acquire, release, openTicket, queues, interruptSession } from "../src/index.ts";
 
 const flush = () => new Promise((r) => setImmediate(r));
 
@@ -144,6 +144,80 @@ test("watchdog: expired lease force-releases a stuck slot", async () => {
   release(q, t2);
   assert.equal(q.active, 0);
   assert.equal(openTicket(q), undefined);
+});
+
+test("cancelling a waiter resolves it without ever consuming a slot", async () => {
+  const q = queueFor("u-cancel-waiter", 1);
+  const t1 = await acquire(q, undefined, "s1");
+  let got: unknown = "pending";
+  const p2 = acquire(q, undefined, "s2").then((t) => {
+    got = t;
+  });
+  await flush();
+  assert.equal(got, "pending");
+  assert.equal(q.waiters.length, 1);
+
+  // The session's execution was interrupted while it was still queued.
+  interruptSession("s2");
+  await p2;
+  assert.equal(got, undefined); // woken without a ticket
+  assert.equal(q.waiters.length, 0);
+  assert.equal(q.active, 1); // the holder is untouched
+
+  // Freeing the slot grants nobody: the cancelled waiter must not take it.
+  release(q, t1!);
+  assert.equal(q.active, 0);
+  assert.equal(q.waiters.length, 0);
+});
+
+test("release skips a cancelled waiter and grants the next live one", async () => {
+  const q = queueFor("u-cancel-mid", 1);
+  const t1 = await acquire(q, undefined, "s1");
+  let got2: unknown = "pending";
+  let got3: unknown = "pending";
+  const p2 = acquire(q, undefined, "s2").then((t) => (got2 = t));
+  const p3 = acquire(q, undefined, "s3").then((t) => {
+    got3 = t;
+    return t;
+  });
+  await flush();
+  assert.equal(q.waiters.length, 2);
+
+  interruptSession("s2");
+  await p2;
+  assert.equal(got2, undefined);
+
+  release(q, t1!);
+  const t3 = await p3;
+  assert.equal(got3, t3);
+  assert.equal(q.active, 1);
+  release(q, t3!);
+  assert.equal(q.active, 0);
+});
+
+test("interrupting a session frees a slot granted but never answered", async () => {
+  const q = queueFor("u-cancel-granted", 1);
+  const ticket = await acquire(q, undefined, "s1");
+  assert.equal(q.active, 1);
+
+  // Interrupted after the grant, before any response body existed: nothing
+  // else would ever release this ticket short of the lease watchdog.
+  interruptSession("s1");
+  assert.equal(ticket!.done, true);
+  assert.equal(q.active, 0);
+  assert.equal(openTicket(q), undefined);
+});
+
+test("interrupting a session leaves a streaming ticket alone", async () => {
+  const q = queueFor("u-cancel-stream", 1);
+  const ticket = await acquire(q, undefined, "s1");
+  ticket!.sawResponse = true; // the stream owns the release (body cancel path)
+
+  interruptSession("s1");
+  assert.equal(q.active, 1);
+
+  release(q, ticket!);
+  assert.equal(q.active, 0);
 });
 
 test("release hands the slot to the next waiter synchronously and keeps held exact", async () => {

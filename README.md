@@ -75,6 +75,9 @@ if any, stays in effect.
   cancelled — not when headers arrive.
 - `retry` hook: reclaims slots from attempts that failed before a response
   body existed.
+- `session.execution.interrupted` event: when you cancel an execution, drops
+  its still-queued request and frees a slot it took but never used, so a
+  cancelled request cannot block the queue.
 - A lease watchdog force-releases any ticket older than 15 minutes, so a lost
   stream can never deadlock the queue.
 

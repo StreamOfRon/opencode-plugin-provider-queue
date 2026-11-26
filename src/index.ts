@@ -32,6 +32,10 @@
 //     for the whole generation, not just until headers arrive.
 //   - "retry" hook releases tickets of attempts that failed before a response
 //     body existed.
+//   - "session.execution.interrupted" drops the session's pending waiters and
+//     releases a ticket granted to it with no response yet: an interrupted
+//     request abandons the "http.request" await before its fetch is dispatched,
+//     so no response/retry/cancel hook will ever free that slot.
 //   - A lease watchdog force-releases any ticket older than 15 minutes so a
 //     lost stream can never deadlock the queue.
 //
@@ -261,13 +265,21 @@ export interface Ticket {
   done: boolean;
   sawResponse: boolean;
   timer: ReturnType<typeof setTimeout> | null;
+  sessionID?: string;
+}
+
+export interface Waiter {
+  sessionID?: string;
+  cancelled: boolean;
+  resolve: (ticket: Ticket | undefined) => void;
+  grant: () => void;
 }
 
 export interface Queue {
   key: string;
   limit: number;
   active: number;
-  waiters: Array<() => void>;
+  waiters: Waiter[];
   held: Ticket[];
 }
 
@@ -285,10 +297,16 @@ export function queueFor(key: string, limit: number): Queue {
   return q;
 }
 
-export function acquire(q: Queue, leaseMs: number = LEASE_MS): Promise<Ticket> {
+// `sessionID` is optional so the queue stays usable on its own; when supplied,
+// it lets an interrupted Session take its place back out of the line.
+export function acquire(q: Queue, leaseMs: number = LEASE_MS, sessionID?: string): Promise<Ticket | undefined> {
   return new Promise((resolveAcquire) => {
     const grant = () => {
-      const ticket: Ticket = { done: false, sawResponse: false, timer: null };
+      if (waiter.cancelled) {
+        resolveAcquire(undefined);
+        return;
+      }
+      const ticket: Ticket = { done: false, sawResponse: false, timer: null, sessionID };
       ticket.timer = setTimeout(() => {
         if (!ticket.done) {
           log(`${q.key}: lease expired, releasing a stuck slot`);
@@ -299,8 +317,9 @@ export function acquire(q: Queue, leaseMs: number = LEASE_MS): Promise<Ticket> {
       q.held.push(ticket);
       resolveAcquire(ticket);
     };
+    const waiter: Waiter = { sessionID, cancelled: false, resolve: resolveAcquire, grant };
     if (q.active < q.limit) grant();
-    else q.waiters.push(grant);
+    else q.waiters.push(waiter);
   });
 }
 
@@ -311,8 +330,38 @@ export function release(q: Queue, ticket: Ticket): void {
   const i = q.held.indexOf(ticket);
   if (i >= 0) q.held.splice(i, 1);
   q.active = Math.max(0, q.active - 1);
-  const next = q.waiters.shift();
-  if (next) next();
+  for (;;) {
+    const next = q.waiters.shift();
+    if (!next) break;
+    if (next.cancelled) continue;
+    next.grant();
+    break;
+  }
+}
+
+// OpenCode interrupts a Session execution by aborting the fiber that awaited
+// `http.request`, which leaves a queued acquire with nobody listening. Reclaim
+// that Session's place: drop its pending waiters and any ticket granted to it
+// that never saw a response (a running stream is cancelled by its own body).
+export function interruptSession(sessionID: string): void {
+  for (const q of queues.values()) {
+    let dropped = 0;
+    for (const waiter of q.waiters) {
+      if (waiter.cancelled || waiter.sessionID !== sessionID) continue;
+      waiter.cancelled = true;
+      dropped += 1;
+      waiter.resolve(undefined);
+    }
+    if (dropped > 0) {
+      q.waiters = q.waiters.filter((waiter) => !waiter.cancelled);
+      log(`${q.key}: interrupted request left the queue (queued=${q.waiters.length})`);
+    }
+    for (const ticket of [...q.held]) {
+      if (ticket.done || ticket.sawResponse || ticket.sessionID !== sessionID) continue;
+      log(`${q.key}: interrupted request released its slot`);
+      release(q, ticket);
+    }
+  }
 }
 
 // The hooks do not expose which request a response belongs to, so the queue
@@ -381,7 +430,8 @@ export function buildHandlers(deps: { locationDirectory: string }): QueueHandler
     if (q.active >= q.limit || q.waiters.length > 0) {
       log(`${q.key}: request waiting (in flight=${q.active}/${q.limit}, queued=${q.waiters.length})`);
     }
-    await acquire(q);
+    const ticket = await acquire(q, LEASE_MS, event.sessionID);
+    if (!ticket) return; // interrupted while queued: never take a slot
     const waited = Date.now() - started;
     if (waited > 0) {
       log(`${q.key}: slot acquired after ${waited}ms wait (in flight=${q.active}/${q.limit}, queued=${q.waiters.length})`);
@@ -468,5 +518,23 @@ export default Plugin.define({
       `loaded for ${locationDirectory} providers=[${[...limits.providers].map(([k, v]) => `${k}:${v}`).join(", ")}] ` +
         `models=[${[...limits.models].map(([k, v]) => `${k}:${v}`).join(", ")}]`,
     );
+
+    // An interrupted execution's `http.request` hook is abandoned mid-await;
+    // nothing downstream (fetch, response, retry) will ever run for it. The
+    // interruption event is the only signal that its slot must be reclaimed.
+    const interruptions = new AbortController();
+    void (async () => {
+      try {
+        for await (const event of ctx.event.subscribe({
+          types: ["session.execution.interrupted"],
+          signal: interruptions.signal,
+        })) {
+          if (event.type === "session.execution.interrupted") interruptSession(event.data.sessionID);
+        }
+      } catch (error) {
+        if (!interruptions.signal.aborted) log(`interruption subscription ended: ${(error as Error).message}`);
+      }
+    })();
+    return () => interruptions.abort();
   },
 });

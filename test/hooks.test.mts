@@ -9,13 +9,13 @@ import { join } from "node:path";
 import test from "node:test";
 
 import "./bootstrap.mts";
-import { buildHandlers, queues, openTicket, release } from "../src/index.ts";
+import plugin, { buildHandlers, queues, openTicket, release, interruptSession } from "../src/index.ts";
 
 // Config fixture: every queued provider at concurrency 1; `otherp` absent.
 const xdg = mkdtempSync(join(tmpdir(), "pq-hooks-xdg-"));
 mkdirSync(join(xdg, "opencode"), { recursive: true });
 const providers: Record<string, unknown> = { testp: { settings: { concurrency: 1 } } };
-for (const p of ["t1p", "t2p", "t3p", "t4p", "t5p", "t6p"]) providers[p] = { settings: { concurrency: 1 } };
+for (const p of ["t1p", "t2p", "t3p", "t4p", "t5p", "t6p", "t7p", "t8p", "t9p"]) providers[p] = { settings: { concurrency: 1 } };
 writeFileSync(join(xdg, "opencode", "opencode.json"), JSON.stringify({ providers }));
 process.env.XDG_CONFIG_HOME = xdg;
 
@@ -159,6 +159,105 @@ test("a queued-model event that resolves unqueued does not inherit the session s
 
   const t = openTicket(q); // cleanup: release fb2's still-held ticket
   if (t) release(q, t);
+});
+
+test("interrupting a queued request keeps the slot for live work", async () => {
+  await handlers.httpRequest(req("t7p", "s1"));
+  const q = queueOf("t7p");
+  const p2 = handlers.httpRequest(req("t7p", "s2"));
+  await flush();
+  assert.equal(q.waiters.length, 1);
+
+  // OpenCode interrupts a request that is still waiting for a slot: the
+  // continuation is abandoned, so the waiter must be removed or it will
+  // consume a slot that nothing will ever release (short of the lease).
+  interruptSession("s2");
+  await flush();
+  assert.equal(q.waiters.length, 0);
+  assert.equal(q.active, 1); // s1's live request is untouched
+
+  release(q, openTicket(q)!); // s1 finishes
+  await flush();
+  assert.equal(q.active, 0); // the cancelled request did not grab the slot
+  await p2;
+});
+
+test("interrupting a session releases a granted ticket with no response", async () => {
+  await handlers.httpRequest(req("t8p", "s1"));
+  const q = queueOf("t8p");
+  assert.equal(q.active, 1);
+
+  interruptSession("s1");
+  assert.equal(q.active, 0);
+  assert.equal(openTicket(q), undefined);
+});
+
+test("interrupting a session does not touch a running stream", async () => {
+  await handlers.httpRequest(req("t9p", "s1"));
+  const q = queueOf("t9p");
+  const ev = { ...req("t9p", "s1"), response: new Response(new ReadableStream()) };
+  handlers.httpResponse(ev);
+  assert.equal(q.active, 1);
+
+  interruptSession("s1");
+  assert.equal(q.active, 1); // the body's cancel path owns this release
+
+  await ev.response.body!.cancel();
+  assert.equal(q.active, 0);
+});
+
+test("setup wires session.execution.interrupted to the queue", async () => {
+  const hooked: Record<string, (event: never) => unknown> = {};
+  const inbox: unknown[] = [];
+  let signal: AbortSignal | undefined;
+  const ctx = {
+    location: { directory: locationDirectory },
+    session: {
+      hook: async (name: string, handler: (event: never) => unknown) => {
+        hooked[name] = handler;
+      },
+    },
+    event: {
+      subscribe: (options: { signal?: AbortSignal } = {}) => {
+        signal = options.signal;
+        return {
+          async *[Symbol.asyncIterator]() {
+            for (;;) {
+              if (options.signal?.aborted) return;
+              const next = inbox.shift();
+              if (next === undefined) {
+                await new Promise((r) => setTimeout(r, 5));
+                continue;
+              }
+              yield next;
+            }
+          },
+        };
+      },
+    },
+  };
+  const cleanup = await plugin.setup(ctx as never);
+  try {
+    const httpRequest = hooked["http.request"]!;
+    await httpRequest(req("testp", "wire1") as never);
+    const q = queueOf("testp");
+    const queued = httpRequest(req("testp", "wire2") as never);
+    await flush();
+    assert.equal(q.waiters.length, 1);
+
+    inbox.push({ type: "session.execution.interrupted", data: { sessionID: "wire2", reason: "user" } });
+    const start = Date.now();
+    while (q.waiters.length > 0 && Date.now() - start < 500) await new Promise((r) => setTimeout(r, 5));
+    assert.equal(q.waiters.length, 0);
+    assert.equal(q.active, 1);
+
+    release(q, openTicket(q)!);
+    await queued;
+    assert.equal(q.active, 0);
+  } finally {
+    await cleanup?.();
+  }
+  assert.equal(signal?.aborted, true); // the subscription is torn down with the plugin
 });
 
 test("unqueued providers pass through", async () => {

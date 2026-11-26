@@ -39,6 +39,15 @@ values are ignored (leave the inherited entry intact).
   corrupts the count.
 - `release()` grants the next waiter synchronously; `openTicket` looks only
   at `held` (released tickets are removed from it).
+- A request interrupted while queued never resumes: OpenCode abandons the
+  `http.request` await, so no `http.response`, `retry`, or body `cancel` will
+  ever fire for it. `interruptSession` (driven by the
+  `session.execution.interrupted` event) must drop that session's pending
+  waiters and release a ticket granted to it that has not seen a response.
+  Without it, the interrupted request takes a slot nobody releases and every
+  later request waits out the 15-minute lease. Do not replace this with a
+  `request.signal` listener: the hook's `Request` is rebuilt by OpenCode and
+  its signal is not tied to session interruption.
 
 ### Module-scope state is intentional
 The server is one process; `queues` is shared across locations, sessions,
